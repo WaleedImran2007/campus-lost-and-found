@@ -1,0 +1,11 @@
+# Local configuration and secrets
+config/config.php
+.env
+.env.*
+
+# Runtime uploads
+public/uploads/items/*
+!public/uploads/items/.gitkeep
+
+storage/evidence/*
+!storage/evidence/.gitkeep
