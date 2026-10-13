@@ -1,0 +1,3 @@
+CREATE USER IF NOT EXISTS 'lostfound'@'localhost' IDENTIFIED BY 'REPLACE_WITH_YOUR_DATABASE_PASSWORD';
+GRANT ALL PRIVILEGES ON campus_lost_found.* TO 'lostfound'@'localhost';
+FLUSH PRIVILEGES;
