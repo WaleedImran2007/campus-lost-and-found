@@ -154,3 +154,50 @@ function valid_password(string $pw): ?string
     return null;
 }
 
+function client_ip(): string
+{
+    return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+}
+
+// ----------------------------------------------------------- rate limits
+/*
+ * Fixed-window counters stored in RATE_LIMITS.
+ * rate_blocked() = "is this key already at the limit?"   rate_hit() = "count one more".
+ * No user row is needed, so it works for guests and unknown emails.
+ */
+function rate_window_start(int $seconds): string
+{
+    return date('Y-m-d H:i:s', intdiv(time(), $seconds) * $seconds);
+}
+
+function rate_blocked(string $name, string $identity): bool
+{
+    [$max, $window] = RATE_LIMITS[$name];
+    $stmt = db()->prepare('SELECT hit_count FROM rate_limits WHERE limit_key = ? AND window_start = ?');
+    $stmt->execute([$name . ':' . $identity, rate_window_start($window)]);
+    return (int) $stmt->fetchColumn() >= $max;
+}
+
+function rate_hit(string $name, string $identity): void
+{
+    [, $window] = RATE_LIMITS[$name];
+    $stmt = db()->prepare(
+        'INSERT INTO rate_limits (limit_key, window_start, hit_count) VALUES (?, ?, 1)
+         ON DUPLICATE KEY UPDATE hit_count = hit_count + 1'
+    );
+    $stmt->execute([$name . ':' . $identity, rate_window_start($window)]);
+
+    if (random_int(1, 50) === 1) {                 // purge old rows now and then
+        db()->exec('DELETE FROM rate_limits WHERE window_start < NOW() - INTERVAL 2 DAY');
+    }
+}
+
+function rate_message(string $name): string
+{
+    [$max, $window] = RATE_LIMITS[$name];
+    $when = $window >= 86400 ? 'per day' : ($window >= 3600 ? 'per hour' : 'in ' . ($window / 60) . ' minutes');
+    return "Limit reached ($max $when). Please try again later.";
+}
+
+// ------------------------------------------------------- audit + notify
+/** Insert one audit row. Call it INSIDE the same transaction as the change. */
