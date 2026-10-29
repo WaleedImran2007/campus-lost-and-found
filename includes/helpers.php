@@ -201,3 +201,82 @@ function rate_message(string $name): string
 
 // ------------------------------------------------------- audit + notify
 /** Insert one audit row. Call it INSIDE the same transaction as the change. */
+function audit_log(?int $actorId, string $action, string $targetType, int $targetId, ?string $details = null): void
+{
+    $stmt = db()->prepare(
+        'INSERT INTO audit_logs (actor_id, action, target_type, target_id, details, ip_address)
+         VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    $stmt->execute([$actorId, $action, $targetType, $targetId, $details, client_ip()]);
+}
+
+function notify(int $userId, string $type, string $text, ?int $itemId = null): void
+{
+    $stmt = db()->prepare(
+        'INSERT INTO notifications (user_id, related_item_id, notification_type, notification_text)
+         VALUES (?, ?, ?, ?)'
+    );
+    $stmt->execute([$userId, $itemId, $type, mb_substr($text, 0, 255)]);
+}
+
+function unread_notifications(int $userId): int
+{
+    $stmt = db()->prepare('SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0');
+    $stmt->execute([$userId]);
+    return (int) $stmt->fetchColumn();
+}
+
+function unread_messages(int $userId): int
+{
+    $stmt = db()->prepare("SELECT COUNT(*) FROM messages WHERE recipient_id = ? AND message_status = 'sent'");
+    $stmt->execute([$userId]);
+    return (int) $stmt->fetchColumn();
+}
+
+// ------------------------------------------------------------- lookups
+function active_categories(): array
+{
+    return db()->query('SELECT category_id, category_name FROM categories WHERE is_active = 1 ORDER BY category_name')->fetchAll();
+}
+
+function active_locations(): array
+{
+    return db()->query('SELECT location_id, location_name FROM campus_locations WHERE is_active = 1 ORDER BY location_name')->fetchAll();
+}
+
+// --------------------------------------------------------------- badges
+function status_label(string $s): string
+{
+    return ucwords(str_replace('_', ' ', $s));
+}
+
+function badge(string $status): string
+{
+    return '<span class="badge badge-' . e($status) . '">' . e(status_label($status)) . '</span>';
+}
+
+function fmt_dt(?string $dt): string
+{
+    return $dt ? date('d M Y, H:i', strtotime($dt)) : '-';
+}
+
+function fmt_date(?string $d): string
+{
+    return $d ? date('d M Y', strtotime($d)) : '-';
+}
+
+function time_ago(string $dt): string
+{
+    $diff = time() - strtotime($dt);
+    if ($diff < 60)    return 'just now';
+    if ($diff < 3600)  return intdiv($diff, 60) . ' min ago';
+    if ($diff < 86400) return intdiv($diff, 3600) . ' h ago';
+    return intdiv($diff, 86400) . ' d ago';
+}
+
+// -------------------------------------------------------------- uploads
+const IMAGE_TYPES = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp', 'image/gif' => 'gif'];
+
+const EVIDENCE_TYPES = IMAGE_TYPES + ['application/pdf' => 'pdf'];
+
+/** Turn $_FILES['x'] (single or multiple) into a flat list of real uploads. */
