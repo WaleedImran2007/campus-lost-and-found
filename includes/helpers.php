@@ -280,3 +280,63 @@ const IMAGE_TYPES = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' =
 const EVIDENCE_TYPES = IMAGE_TYPES + ['application/pdf' => 'pdf'];
 
 /** Turn $_FILES['x'] (single or multiple) into a flat list of real uploads. */
+function collect_files(string $field): array
+{
+    if (empty($_FILES[$field])) {
+        return [];
+    }
+    
+    $f = $_FILES[$field];
+    $out = [];
+
+    if (is_array($f['name'])) {
+        foreach ($f['name'] as $i => $name) {
+            if ($f['error'][$i] === UPLOAD_ERR_NO_FILE) continue;
+            $out[] = ['name' => $name, 'tmp_name' => $f['tmp_name'][$i], 'error' => $f['error'][$i], 'size' => $f['size'][$i]];
+        }
+    } elseif ($f['error'] !== UPLOAD_ERR_NO_FILE) {
+        $out[] = $f;
+    }
+    return $out;
+}
+
+/** Returns an error message, or null when the file is acceptable. Content is checked, not the file name. */
+function check_upload(array $file, array $allowedTypes, int $maxBytes): ?string
+{
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        return 'Upload failed (error code ' . (int) $file['error'] . ').';
+    }
+
+    if ($file['size'] > $maxBytes) {
+        return 'File too large (max ' . round($maxBytes / 1048576, 1) . ' MB).';
+    }
+
+    if (!is_uploaded_file($file['tmp_name'])) {
+        return 'Invalid upload.';
+    }
+
+    $mime = (new finfo(FILEINFO_MIME_TYPE))->file($file['tmp_name']);
+    if (!isset($allowedTypes[$mime])) {
+        return 'Only ' . implode(', ', array_unique(array_values($allowedTypes))) . ' files are allowed.';
+    }
+
+    if (str_starts_with($mime, 'image/') && @getimagesize($file['tmp_name']) === false) {
+        return 'The file is not a valid image.';
+    }
+    
+    return null;
+}
+
+/** Saves under a random name and returns the stored file name. */
+function store_upload(array $file, array $allowedTypes, string $dir): string
+{
+    $mime = (new finfo(FILEINFO_MIME_TYPE))->file($file['tmp_name']);
+    $name = bin2hex(random_bytes(16)) . '.' . $allowedTypes[$mime];
+    if (!is_dir($dir)) {
+        mkdir($dir, 0775, true);
+    }
+    if (!move_uploaded_file($file['tmp_name'], $dir . '/' . $name)) {
+        throw new RuntimeException('Could not save the uploaded file.');
+    }
+    return $name;
+}
