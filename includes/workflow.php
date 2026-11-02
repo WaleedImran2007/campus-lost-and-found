@@ -280,3 +280,36 @@ function message_allowed(array $item, int $senderId, int $recipientId): ?string
        || ($b === 'staff' && $a === 'claimant');
     return $ok ? null : 'On a found item, messages go only between the poster, people with an active claim, and custodians.';
 }
+// ================================================================== ITEMS
+/** Poster closes their own listing. Lost: recovered|closed. Found: closed, only while open. */
+function poster_set_status(int $itemId, int $userId, string $to): array
+{
+    return in_transaction(function (PDO $pdo) use ($itemId, $userId, $to) {
+        $item = lock_item($itemId);
+        if ((int) $item['reporter_id'] !== $userId) fail('Only the poster can do this.');
+        if ($to === 'recovered' && $item['report_type'] !== 'lost') fail('Found items become recovered only through a handover.');
+        if (!in_array($to, ['recovered', 'closed'], true)) fail('Invalid status.');
+
+        $st = $pdo->prepare("UPDATE items SET item_status = ? WHERE item_id = ? AND reporter_id = ? AND item_status = 'open'");
+        $st->execute([$to, $itemId, $userId]);
+        if ($st->rowCount() !== 1) fail('Only an open listing can be changed.');
+
+        audit_log($userId, 'item_status_changed', 'item', $itemId, "open -> $to");
+        return 'Listing marked as ' . $to . '.';
+    });
+}
+
+function staff_close_found_item(int $itemId, array $staff): array
+{
+    return in_transaction(function (PDO $pdo) use ($itemId, $staff) {
+        $item = lock_item($itemId);
+        if ($item['report_type'] !== 'found') fail('Only found items can be closed by staff.');
+        $st = $pdo->prepare("UPDATE items SET item_status = 'closed' WHERE item_id = ? AND item_status = 'open'");
+        $st->execute([$itemId]);
+        if ($st->rowCount() !== 1) fail('Only an open item (with no active claims) can be closed.');
+        audit_log((int) $staff['user_id'], 'item_status_changed', 'item', $itemId, 'open -> closed (by staff)');
+        return 'Item closed.';
+    });
+}
+
+/** Admin: any status -> removed. Active claims are withdrawn/rejected and handovers cancelled. */
