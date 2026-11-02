@@ -241,3 +241,42 @@ function revoke_approval(int $claimId, array $reviewer, string $reason): array
     });
 }
 
+// ================================================================ MESSAGES
+/** Business Rule 10. Returns an error text, or null when sender may message recipient about this item. */
+function message_allowed(array $item, int $senderId, int $recipientId): ?string
+{
+    if ($senderId === $recipientId) return 'You cannot message yourself.';
+    if (in_array($item['item_status'], ['recovered', 'closed', 'removed'], true)) return 'Messaging is closed for this item.';
+
+    $u = db()->prepare("SELECT role FROM users WHERE user_id = ? AND account_status <> 'deactivated'");
+    $u->execute([$recipientId]);
+    if (!$u->fetchColumn()) return 'That user does not exist.';
+
+    $poster = (int) $item['reporter_id'];
+
+    if ($item['report_type'] === 'lost') {
+        if ($recipientId === $poster) return null;                       // anyone may message the poster
+        $m = db()->prepare('SELECT 1 FROM messages WHERE item_id = ? AND sender_id = ? AND recipient_id = ? LIMIT 1');
+        $m->execute([$item['item_id'], $recipientId, $senderId]);        // the poster may only answer
+        return $m->fetchColumn() ? null : 'On a lost item you can only message the poster.';
+    }
+
+    // found item: poster <-> active claimants, and custodians/admins <-> poster/claimants
+    $roleOf = function (int $uid) use ($item, $poster): ?string {
+        $r = db()->prepare('SELECT role FROM users WHERE user_id = ?');
+        $r->execute([$uid]);
+        $role = $r->fetchColumn();
+        if (in_array($role, ['custodian', 'admin'], true)) return 'staff';
+        if ($uid === $poster) return 'poster';
+        $c = db()->prepare("SELECT 1 FROM claims WHERE item_id = ? AND claimant_id = ? AND claim_status IN ('pending','under_review','approved')");
+        $c->execute([$item['item_id'], $uid]);
+        return $c->fetchColumn() ? 'claimant' : null;
+    };
+    $a = $roleOf($senderId);
+    $b = $roleOf($recipientId);
+    $ok = ($a === 'poster' && in_array($b, ['claimant', 'staff'], true))
+       || ($b === 'poster' && in_array($a, ['claimant', 'staff'], true))
+       || ($a === 'staff' && $b === 'claimant')
+       || ($b === 'staff' && $a === 'claimant');
+    return $ok ? null : 'On a found item, messages go only between the poster, people with an active claim, and custodians.';
+}
