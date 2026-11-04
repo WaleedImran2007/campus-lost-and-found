@@ -389,3 +389,97 @@ function complete_handover(int $handoverId, array $custodian, string $notes): ar
         return 'Handover completed. The item is marked as recovered.';
     });
 }
+function remove_item(int $itemId, array $admin, string $reason): array
+{
+    return in_transaction(function (PDO $pdo) use ($itemId, $admin, $reason) {
+        check_reason($reason);
+        $item = lock_item($itemId);
+        if ($item['item_status'] === 'removed') fail('Already removed.');
+        $old = $item['item_status'];
+
+        $pdo->prepare("UPDATE claims SET claim_status = 'withdrawn' WHERE item_id = ? AND claim_status IN ('pending','under_review')")->execute([$itemId]);
+        $pdo->prepare("UPDATE claims SET claim_status = 'rejected', review_reason = 'Listing removed', reviewed_by = ?, reviewed_at = NOW()
+                       WHERE item_id = ? AND claim_status = 'approved' AND claimant_id <> ?")->execute([$admin['user_id'], $itemId, $admin['user_id']]);
+        $pdo->prepare("UPDATE handovers h JOIN claims c ON c.claim_id = h.claim_id SET h.handover_status = 'cancelled'
+                       WHERE c.item_id = ? AND h.handover_status = 'scheduled'")->execute([$itemId]);
+        $pdo->prepare("UPDATE items SET item_status = 'removed' WHERE item_id = ?")->execute([$itemId]);
+
+        audit_log((int) $admin['user_id'], 'item_removed', 'item', $itemId, "$old -> removed. $reason");
+        notify((int) $item['reporter_id'], 'report_update', 'Your listing "' . $item['title'] . '" was removed by an administrator.', $itemId);
+        return 'Listing removed.';
+    });
+}
+
+// ================================================================== USERS
+function count_active_admins(): int
+{
+    $rows = db()->query("SELECT user_id FROM users WHERE role = 'admin' AND account_status = 'active' FOR UPDATE")->fetchAll();
+    return count($rows);
+}
+
+function suspend_user(int $targetId, array $admin, ?int $days, string $reason): array
+{
+    return in_transaction(function (PDO $pdo) use ($targetId, $admin, $days, $reason) {
+        check_reason($reason, 'A suspension reason');
+        $admins = count_active_admins();                               // also locks the admin rows
+        $stmt = $pdo->prepare('SELECT * FROM users WHERE user_id = ? FOR UPDATE');
+        $stmt->execute([$targetId]);
+        $target = $stmt->fetch() ?: fail('User not found.');
+
+        if ((int) $target['user_id'] === (int) $admin['user_id']) fail('You cannot suspend yourself.');
+        if ($target['role'] === 'admin' && $target['account_status'] === 'active' && $admins <= 1) {
+            fail('The last active admin cannot be suspended.');
+        }
+        if ($target['account_status'] === 'deactivated') fail('This account is deactivated.');
+
+        $until = ($days !== null && $days > 0) ? date('Y-m-d H:i:s', strtotime("+$days days")) : null;
+        $pdo->prepare("UPDATE users SET account_status = 'suspended', suspended_until = ?, suspension_reason = ? WHERE user_id = ?")
+            ->execute([$until, mb_substr($reason, 0, 255), $targetId]);
+        audit_log((int) $admin['user_id'], 'user_suspended', 'user', $targetId, ($until ? "until $until. " : 'open-ended. ') . $reason);
+
+        // Business Rule 2: pending claims of a suspended user are withdrawn by the system.
+        $claims = $pdo->prepare("SELECT claim_id, item_id FROM claims WHERE claimant_id = ? AND claim_status IN ('pending','under_review')");
+        $claims->execute([$targetId]);
+        foreach ($claims->fetchAll() as $c) {
+            lock_item((int) $c['item_id']);
+            $w = $pdo->prepare("UPDATE claims SET claim_status = 'withdrawn' WHERE claim_id = ? AND claim_status IN ('pending','under_review')");
+            $w->execute([$c['claim_id']]);
+            if ($w->rowCount() === 1) {
+                audit_log(null, 'claim_withdrawn_by_system', 'claim', (int) $c['claim_id'], 'Claimant suspended');
+                reopen_if_no_active_claims((int) $c['item_id']);
+            }
+        }
+        return 'User suspended.';
+    });
+}
+
+function reactivate_user(int $targetId, array $admin): array
+{
+    return in_transaction(function (PDO $pdo) use ($targetId, $admin) {
+        $st = $pdo->prepare("UPDATE users SET account_status = 'active', suspended_until = NULL, suspension_reason = NULL
+                             WHERE user_id = ? AND account_status = 'suspended'");
+        $st->execute([$targetId]);
+        if ($st->rowCount() !== 1) fail('This user is not suspended.');
+        audit_log((int) $admin['user_id'], 'user_reactivated', 'user', $targetId);
+        return 'User reactivated.';
+    });
+}
+
+function change_role(int $targetId, array $admin, string $newRole): array
+{
+    return in_transaction(function (PDO $pdo) use ($targetId, $admin, $newRole) {
+        if (!in_array($newRole, ['student', 'custodian', 'admin'], true)) fail('Invalid role.');
+        $admins = count_active_admins();
+        $stmt = $pdo->prepare('SELECT * FROM users WHERE user_id = ? FOR UPDATE');
+        $stmt->execute([$targetId]);
+        $target = $stmt->fetch() ?: fail('User not found.');
+        if ($target['role'] === $newRole) fail('The user already has this role.');
+        if ($target['role'] === 'admin' && $target['account_status'] === 'active' && $admins <= 1) {
+            fail('The last active admin cannot be demoted.');
+        }
+        $pdo->prepare('UPDATE users SET role = ? WHERE user_id = ?')->execute([$newRole, $targetId]);
+        audit_log((int) $admin['user_id'], 'role_changed', 'user', $targetId, $target['role'] . ' -> ' . $newRole);
+        return 'Role changed to ' . $newRole . '.';
+    });
+}
+
