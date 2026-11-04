@@ -313,3 +313,79 @@ function staff_close_found_item(int $itemId, array $staff): array
 }
 
 /** Admin: any status -> removed. Active claims are withdrawn/rejected and handovers cancelled. */
+function schedule_handover(int $claimId, array $custodian, string $when): array
+{
+    return in_transaction(function (PDO $pdo) use ($claimId, $custodian, $when) {
+        $claim = load_claim($claimId);
+        $item  = lock_item((int) $claim['item_id']);
+        if (!in_array($custodian['role'], ['custodian', 'admin'], true)) fail('Only staff can schedule handovers.');
+        check_reviewer($custodian, $claim, $item);
+        if ($claim['claim_status'] !== 'approved' || $item['item_status'] !== 'ready_for_handover') {
+            fail('A handover can only be scheduled for an approved claim.');
+        }
+        $ts = strtotime($when);
+        if ($ts === false || $ts < time() - 300 || $ts > strtotime('+60 days')) fail('Choose a date and time within the next 60 days.');
+        $dt = date('Y-m-d H:i:s', $ts);
+
+        $stmt = $pdo->prepare('SELECT handover_id, handover_status FROM handovers WHERE claim_id = ? FOR UPDATE');
+        $stmt->execute([$claimId]);
+        $existing = $stmt->fetch();
+
+        if (!$existing) {
+            $pdo->prepare('INSERT INTO handovers (claim_id, custodian_id, scheduled_at) VALUES (?, ?, ?)')
+                ->execute([$claimId, $custodian['user_id'], $dt]);
+            $hid = (int) $pdo->lastInsertId();
+        } elseif ($existing['handover_status'] === 'scheduled') {          // reschedule = update the same row
+            $pdo->prepare('UPDATE handovers SET scheduled_at = ?, custodian_id = ? WHERE handover_id = ?')
+                ->execute([$dt, $custodian['user_id'], $existing['handover_id']]);
+            $hid = (int) $existing['handover_id'];
+        } else {
+            fail('This handover is already ' . $existing['handover_status'] . '.');
+        }
+
+        audit_log((int) $custodian['user_id'], 'handover_scheduled', 'handover', $hid, $dt);
+        notify((int) $claim['claimant_id'], 'handover_scheduled',
+            'Handover for "' . $item['title'] . '" is scheduled for ' . date('d M Y, H:i', $ts) . '. Bring your university ID.', (int) $item['item_id']);
+        return 'Handover scheduled for ' . date('d M Y, H:i', $ts) . '.';
+    });
+}
+
+function complete_handover(int $handoverId, array $custodian, string $notes): array
+{
+    return in_transaction(function (PDO $pdo) use ($handoverId, $custodian, $notes) {
+        $stmt = $pdo->prepare('SELECT * FROM handovers WHERE handover_id = ?');
+        $stmt->execute([$handoverId]);
+        $h = $stmt->fetch() ?: fail('Handover not found.');
+
+        $claim = load_claim((int) $h['claim_id']);
+        $item  = lock_item((int) $claim['item_id']);
+        check_reviewer($custodian, $claim, $item);
+
+        if ($h['handover_status'] !== 'scheduled' || $claim['claim_status'] !== 'approved' || $item['item_status'] !== 'ready_for_handover') {
+            fail('This handover cannot be completed (it must be scheduled for an approved claim).');
+        }
+
+        $count = $pdo->prepare('SELECT COUNT(*) FROM claims WHERE item_id = ?');
+        $count->execute([$item['item_id']]);
+        $disputed = (int) $count->fetchColumn() > 1;
+        if (($item['is_high_value'] || $disputed) && str_len($notes) < 5) {
+            fail('This is a high-value or disputed item: write the ID check in the notes first.');
+        }
+        if (str_len($notes) > 255) fail('Notes can be at most 255 characters.');
+
+        $upd = $pdo->prepare("UPDATE handovers SET handover_status = 'completed', completed_at = NOW(), notes = ?, custodian_id = ?
+                              WHERE handover_id = ? AND handover_status = 'scheduled'");
+        $upd->execute([$notes === '' ? null : $notes, $custodian['user_id'], $handoverId]);
+        if ($upd->rowCount() !== 1) fail('This handover was just changed by someone else.');
+
+        $st = $pdo->prepare("UPDATE items SET item_status = 'recovered' WHERE item_id = ? AND item_status = 'ready_for_handover'");
+        $st->execute([$item['item_id']]);
+        if ($st->rowCount() !== 1) fail('The item changed. Please reload.');
+
+        audit_log((int) $custodian['user_id'], 'handover_completed', 'handover', $handoverId, $notes);
+        audit_log((int) $custodian['user_id'], 'item_status_changed', 'item', (int) $item['item_id'], 'ready_for_handover -> recovered');
+        notify((int) $claim['claimant_id'], 'item_recovered', 'You received "' . $item['title'] . '". Glad it is back with you!', (int) $item['item_id']);
+        notify((int) $item['reporter_id'], 'item_recovered', 'Your found item "' . $item['title'] . '" was handed over to its owner. Thank you!', (int) $item['item_id']);
+        return 'Handover completed. The item is marked as recovered.';
+    });
+}
